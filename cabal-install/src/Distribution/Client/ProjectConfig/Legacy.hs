@@ -177,14 +177,14 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
-import Network.URI (URI (..), parseURI)
+import Network.URI (URI (..), parseRelativeReference, parseURI, relativeTo, uriToString)
 
 import Distribution.Fields.ConfVar (parseConditionConfVarFromClause)
 
 import Distribution.Client.HttpUtils
 import Distribution.Client.ReplFlags (multiReplOption)
 import System.Directory (createDirectoryIfMissing)
-import System.FilePath (isAbsolute, isPathSeparator, makeValid, takeDirectory, (</>))
+import System.FilePath (isAbsolute, isPathSeparator, isRelative, isValid, makeValid, takeDirectory, (</>))
 
 ------------------------------------------------------------------
 -- Handle extended project config files with conditionals and imports.
@@ -195,6 +195,17 @@ import System.FilePath (isAbsolute, isPathSeparator, makeValid, takeDirectory, (
 type ProjectConfigSkeleton = CondTree ConfVar [ProjectConfigImport] ProjectConfig
 
 type ProjectConfigImport = String
+
+resolveProjectConfigImport :: ProjectConfigImport -> ProjectConfigImport -> Maybe ProjectConfigImport
+resolveProjectConfigImport source target
+  -- Absolute target: ignore source
+  | Just _ <- parseURI target = Just target
+  | isValid target && isAbsolute target = Just target
+  -- Absolute source, relative target
+  | Just base <- parseURI source, Just rel <- parseRelativeReference target = Just $ uriToString id (rel `relativeTo` base) ""
+  | isValid source && isAbsolute source && isValid target && isRelative target = Just $ takeDirectory source </> target
+  -- Any other combination fails
+  | otherwise = Nothing
 
 singletonProjectConfigSkeleton :: ProjectConfig -> ProjectConfigSkeleton
 singletonProjectConfigSkeleton x = CondNode x mempty mempty
@@ -226,15 +237,16 @@ instantiateProjectConfigSkeletonWithCompiler os arch impl _flags skel = go $ map
 projectSkeletonImports :: ProjectConfigSkeleton -> [ProjectConfigImport]
 projectSkeletonImports = view traverseCondTreeC
 
-parseProjectSkeleton :: FilePath -> HttpTransport -> Verbosity -> [ProjectConfigImport] -> FilePath -> BS.ByteString -> IO (ParseResult ProjectConfigSkeleton)
+parseProjectSkeleton :: FilePath -> HttpTransport -> Verbosity -> [ProjectConfigImport] -> ProjectConfigImport -> BS.ByteString -> IO (ParseResult ProjectConfigSkeleton)
 parseProjectSkeleton cacheDir httpTransport verbosity seenImports source bs = (sanityWalkPCS False =<<) <$> liftPR (go []) (ParseUtils.readFields bs)
   where
     go :: [ParseUtils.Field] -> [ParseUtils.Field] -> IO (ParseResult ProjectConfigSkeleton)
     go acc (x : xs) = case x of
-      (ParseUtils.F l "import" importLoc) ->
-        if importLoc `elem` seenImports
-          then pure . parseFail $ ParseUtils.FromString ("cyclical import of " ++ importLoc) (Just l)
-          else do
+      (ParseUtils.F l "import" importRef) ->
+        case resolveProjectConfigImport source importRef of
+          Nothing -> pure . parseFail $ ParseUtils.FromString ("bad import: " ++ importRef) (Just l)
+          Just importLoc | importLoc `elem` seenImports -> pure . parseFail $ ParseUtils.FromString ("cyclical import of " ++ importLoc) (Just l)
+          Just importLoc -> do
             let fs = fmap (\z -> CondNode z [importLoc] mempty) $ fieldsToConfig (reverse acc)
             res <- parseProjectSkeleton cacheDir httpTransport verbosity (importLoc : seenImports) importLoc =<< fetchImportConfig importLoc
             rest <- go [] xs
@@ -284,6 +296,7 @@ parseProjectSkeleton cacheDir httpTransport verbosity seenImports source bs = (s
         addWarnings x' = x'
     liftPR _ (ParseFailed e) = pure $ ParseFailed e
 
+    -- Assume pci has already been resolved to an absolute location.
     fetchImportConfig :: ProjectConfigImport -> IO BS.ByteString
     fetchImportConfig pci = case parseURI pci of
       Just uri -> do
@@ -291,9 +304,7 @@ parseProjectSkeleton cacheDir httpTransport verbosity seenImports source bs = (s
         createDirectoryIfMissing True cacheDir
         _ <- downloadURI httpTransport verbosity uri fp
         BS.readFile fp
-      Nothing ->
-        BS.readFile $
-          if isAbsolute pci then pci else takeDirectory source </> pci
+      Nothing -> BS.readFile pci
 
     modifiesCompiler :: ProjectConfig -> Bool
     modifiesCompiler pc = isSet projectConfigHcFlavor || isSet projectConfigHcPath || isSet projectConfigHcPkg
