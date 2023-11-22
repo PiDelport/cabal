@@ -1,2 +1,4 @@
 package dep
   ghc-options: -O2
+
+import: extra.project
